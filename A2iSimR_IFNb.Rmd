@@ -1,0 +1,440 @@
+---
+title: "A2iSimR_project_IFNb"
+output: html_document
+date: "2026-09-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Set WD}
+setwd("/Users/ulrikke/Desktop/Final_project")
+```
+
+```{r installation of A2iSim}
+dir.create("R_library", showWarnings = FALSE)
+# install.packages("A2iSimR_1.2.1.9017_HEK293T_Neuron_calibrated.tar.gz",
+# repos = NULL, type = "source", lib = "R_library")
+library(A2iSimR, lib.loc = "R_library")
+packageVersion("A2iSimR")
+```
+
+Generate your first set of simulated editing sites
+
+```{r}
+p <- a2i_calibrated_params("HEK293T__joint_condition_primary")
+f0 <- a2i_make_features(p, n_transcripts = 4000, n_sites = 10000, seed = 101)
+nrow(f0$site_info)
+```
+
+
+```{r}
+names(p)
+names(p$sites)
+names(p$sites$by_site_class)
+head(f0$site_info[, c("site_id", "editable", "baseline_edit","de_logit_shift_conditionADAR1KO_IFNb")])
+
+```
+
+
+```{r making settings for features}
+f <- f0 # Reset to the original generated panel before each scenario.
+n_reps <-8
+strength <- 1 # 0 = no WT/KO difference; 0.5 = weaker; 2 = stronger.
+target_depth <- 100 # Expected site reads per sample, not an exact count.
+phi <- 50 # Beta precision: smaller = more extra variation.
+
+#The below explains how much differenct we want beteen WT/KO. 0 = no difference, 0.5 = weaker; 2 = stronger. Ours is on 1. 
+#This has to be done for all contrasts
+f$site_info$de_logit_shift_conditionADAR1KO_mock <- strength * f0$site_info$de_logit_shift_conditionADAR1KO_mock
+
+f$site_info$de_logit_shift_conditionADAR1KO_IFNb <- strength * f0$site_info$de_logit_shift_conditionADAR1KO_IFNb
+
+f$site_info$de_logit_shift_conditionADAR1p150KO_IFNb <- strength * f0$site_info$de_logit_shift_conditionADAR1p150KO_IFNb
+
+f$site_info$de_logit_shift_conditionADAR1p150KO_mock <- strength * f0$site_info$de_logit_shift_conditionADAR1p150KO_mock
+
+f$site_info$de_logit_shift_conditionWT_IFNb <- strength * f0$site_info$de_logit_shift_conditionWT_IFNb
+
+
+f$site_info$editing_sampling_model <- "beta_binomial"
+
+#How big do we want the variance. Smaller number = bigger variance
+f$site_info$precision <- phi
+
+#Every transcript gets the same mean 
+f$transcript_info$baseline_expr <- 1000
+f$site_info$site_depth_multiplier <- target_depth / 1000
+f$site_info$coverage_fraction <- f$site_info$site_depth_multiplier
+
+#To normalize the data?
+p$design$lib_condition_scale[] <- 1
+p$design$lib_sdlog <- 0
+
+#How many repetitions per condition
+# p$design$n_per_condition[] <- n_reps
+
+
+```
+
+
+```{r simulations#1}
+sim <- a2i_simulate(p,
+transcript_info = f$transcript_info, site_info = f$site_info,
+n_per_condition = c(WT_IFNb = n_reps, ADAR1KO_IFNb = n_reps), seed = 102)
+counts <- a2i_refalt_counts(sim)
+```
+
+```{r pooled editing code}
+#Pooled editing across all samples:
+
+min_editing <- 0.10
+
+overall <- rowSums(counts$alt) / rowSums(counts$alt + counts$ref)
+pass_edit <- overall >= min_editing
+```
+
+
+```{r filtering sites by 10 percentage and at least 2 replictaes}
+min_depth   <- 10   # per-replicate usable depth
+min_alt     <- 2    # reads needed to call a site detected in a replicate
+min_reps    <- 2    # replicates per condition
+min_editing <- 0.10
+
+prop  <- counts$alt / (counts$alt + counts$ref)
+usable <- (counts$alt + counts$ref) >= min_depth
+cond  <- counts$sample_info$condition
+
+# per-replicate detection
+detected <- usable & counts$alt >= min_alt
+
+# collapse to conditions
+by_cond <- function(mat, f) sapply(split(seq_len(ncol(mat)), cond),
+                                   function(j) f(mat[, j, drop = FALSE]))
+
+n_detected <- by_cond(detected, function(m) rowSums(m))
+mean_edit  <- by_cond(prop * usable, rowSums) / pmax(by_cond(usable, rowSums), 1)
+
+pass_reps <- apply(n_detected, 1, max) >= min_reps
+pass_edit <- apply(mean_edit,  1, max) >= min_editing
+keep      <- pass_reps & pass_edit
+
+sites <- counts$site_info$site_id[keep]
+```
+
+
+```{r installation of tidyverse and patchwork}
+#install.packages("tidyverse")
+#install.packages("patchwork")
+```
+
+
+```{r plots of editing proportions, scatters plots comparing WT vs ADAR_KO, Site numbers}
+# ---------------------------------------------------------------
+# ggplot2 plots for an A2iSimR two-group simulation
+# (WT_IFNb vs ADAR1KO_IFNb)
+#
+# Expects `counts <- a2i_refalt_counts(sim)` in the environment.
+# Needs ggplot2 only; reshaping is done in base R.
+# ---------------------------------------------------------------
+
+library(ggplot2)
+
+# Define the conditions
+COND_A <- "WT_IFNb"        # x axis / reference
+COND_B <- "ADAR1KO_IFNb"   # y axis
+
+# Define the percentage of what should be edited and how many replicates the editing has been observed
+MIN_DEPTH   <- 10
+MIN_ALT     <- 2
+MIN_REPS    <- 2
+MIN_EDITING <- 0.10
+
+# Color palette
+PAL <- c(null = "#BDBDBD", editable = "#2C7FB8", differential = "#D7301F")
+
+# Define the theme
+theme_a2i <- theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))
+
+# ---- shared quantities ----------------------------------------
+
+a2i_prep <- function(counts,
+                     min_depth = MIN_DEPTH,
+                     min_alt   = MIN_ALT) {
+  cond     <- as.character(counts$sample_info$condition)
+  usable_n <- counts$alt + counts$ref
+
+  prop     <- usable_n
+  prop[]   <- NA_real_
+  ok       <- usable_n > 0
+  prop[ok] <- counts$alt[ok] / usable_n[ok]
+
+  usable   <- usable_n >= min_depth
+  detected <- usable & counts$alt >= min_alt
+
+  by_cond <- function(f) {
+    idx <- split(seq_along(cond), cond)
+    do.call(cbind, lapply(idx, f))
+  }
+
+  n_usable   <- by_cond(function(j) rowSums(usable[, j, drop = FALSE]))
+  n_detected <- by_cond(function(j) rowSums(detected[, j, drop = FALSE]))
+
+  # mean of per-replicate proportions, over usable replicates only
+  mean_edit <- by_cond(function(j) {
+    p <- prop[, j, drop = FALSE]; u <- usable[, j, drop = FALSE]
+    n <- rowSums(u)
+    ifelse(n > 0, rowSums(p * u, na.rm = TRUE) / n, NA_real_)
+  })
+
+  # depth-weighted pooled alternative
+  pooled_edit <- by_cond(function(j) {
+    a <- rowSums(counts$alt[, j, drop = FALSE])
+    d <- rowSums(usable_n[, j, drop = FALSE])
+    ifelse(d > 0, a / d, NA_real_)
+  })
+
+  mean_depth <- by_cond(function(j) rowMeans(usable_n[, j, drop = FALSE]))
+
+  list(cond = cond, prop = prop, usable = usable, detected = detected,
+       n_usable = n_usable, n_detected = n_detected,
+       mean_edit = mean_edit, pooled_edit = pooled_edit,
+       mean_depth = mean_depth, site_info = counts$site_info)
+}
+
+a2i_truth_class <- function(site_info,
+                            a_col = "de_logit_shift_conditionWT_IFNb",
+                            b_col = "de_logit_shift_conditionADAR1KO_IFNb",
+                            tol = 0) {
+  cls <- rep("null", nrow(site_info))
+  cls[site_info$editable] <- "editable"
+  true_diff <- site_info[[b_col]] - site_info[[a_col]]
+  cls[site_info$editable & abs(true_diff) > tol] <- "differential"
+  factor(cls, levels = c("null", "editable", "differential"))
+}
+
+a2i_keep <- function(pr, min_reps = MIN_REPS, min_editing = MIN_EDITING) {
+  pass_reps <- apply(pr$n_detected, 1, max) >= min_reps
+  edit_max  <- suppressWarnings(apply(pr$mean_edit, 1, max, na.rm = TRUE))
+  pass_reps & is.finite(edit_max) & edit_max >= min_editing
+}
+
+# tidy one row per site, for the scatter family
+a2i_site_df <- function(pr, keep = NULL,
+                        estimator = c("mean", "pooled")) {
+  estimator <- match.arg(estimator)
+  m <- if (estimator == "mean") pr$mean_edit else pr$pooled_edit
+  if (is.null(keep)) keep <- rep(TRUE, nrow(m))
+
+  df <- data.frame(
+    site_id    = pr$site_info$site_id[keep],
+    site_class = pr$site_info$site_class[keep],
+    x          = m[keep, COND_A],
+    y          = m[keep, COND_B],
+    depth      = rowMeans(pr$mean_depth[keep, , drop = FALSE]),
+    truth      = a2i_truth_class(pr$site_info)[keep],
+    stringsAsFactors = FALSE
+  )
+  df[is.finite(df$x) & is.finite(df$y), ]
+}
+
+# ---- 1. scatter: WT_IFNb vs ADAR1KO_IFNb, linear + logit facets ----------
+
+a2i_gg_scatter <- function(pr, keep = NULL,
+                           estimator = c("mean", "pooled"),
+                           eps = 0.005) {
+  df <- a2i_site_df(pr, keep, estimator)
+  lg <- function(v) log((v + eps) / (1 - v + eps))
+
+  long <- rbind(
+    transform(df, xv = df$x,     yv = df$y,     scale = "linear"),
+    transform(df, xv = lg(df$x), yv = lg(df$y), scale = "logit")
+  )
+  long$scale <- factor(long$scale, levels = c("linear", "logit"))
+
+  ggplot(long, aes(xv, yv, colour = truth, size = depth)) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", colour = "grey40") +
+    geom_point(alpha = 0.6) +
+    facet_wrap(~scale, scales = "free") +
+    scale_colour_manual(values = PAL, name = "truth") +
+    scale_size_continuous(range = c(0.6, 3), name = "mean depth") +
+    labs(x = paste(COND_A, "editing"),
+         y = paste(COND_B, "editing"),
+         title = "Editing proportion, WT_IFNb vs ADAR1KO_IFNb",
+         subtitle = sprintf("%s estimator; logit panel uses eps = %.3f",
+                            match.arg(estimator), eps)) +
+    theme_a2i
+}
+
+# ---- 2. MA-style: difference vs level --------------------------
+
+a2i_gg_ma <- function(pr, keep = NULL, estimator = c("mean", "pooled")) {
+  df <- a2i_site_df(pr, keep, estimator)
+  df$avg <- (df$x + df$y) / 2
+  df$dif <- df$y - df$x
+
+  ggplot(df, aes(avg, dif, colour = truth)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_point(alpha = 0.6, size = 1.4) +
+    scale_colour_manual(values = PAL, name = "truth") +
+    labs(x = "mean editing across conditions",
+         y = paste0(COND_B, " \u2212 ", COND_A),
+         title = "Difference vs level") +
+    theme_a2i
+}
+
+# ---- 3a. filter cascade ---------------------------------------
+
+a2i_gg_cascade <- function(pr, min_reps = MIN_REPS, min_editing = MIN_EDITING) {
+  pass_reps <- apply(pr$n_detected, 1, max) >= min_reps
+  edit_max  <- suppressWarnings(apply(pr$mean_edit, 1, max, na.rm = TRUE))
+  pass_edit <- is.finite(edit_max) & edit_max >= min_editing
+
+  labs_ <- c("simulated",
+             "any usable depth",
+             sprintf("detected in >=%d reps", min_reps),
+             sprintf("+ >=%d%% editing", round(min_editing * 100)))
+  df <- data.frame(
+    step = factor(labs_, levels = labs_),
+    n    = c(nrow(pr$n_detected),
+             sum(rowSums(pr$n_usable) > 0),
+             sum(pass_reps),
+             sum(pass_reps & pass_edit))
+  )
+
+  ggplot(df, aes(step, n)) +
+    geom_col(fill = "#4292C6", width = 0.7) +
+    geom_text(aes(label = n), vjust = -0.4, size = 3.4) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(x = NULL, y = "sites", title = "Filter cascade") +
+    theme_a2i +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+# ---- 3b. detected sites per condition, by site class -----------
+
+a2i_gg_by_class <- function(pr, min_reps = MIN_REPS) {
+  conds <- colnames(pr$n_detected)
+  df <- do.call(rbind, lapply(conds, function(cn) {
+    hit <- pr$n_detected[, cn] >= min_reps
+    tb  <- as.data.frame(table(site_class = pr$site_info$site_class[hit]),
+                         stringsAsFactors = FALSE)
+    tb$condition <- cn
+    tb
+  }))
+  names(df)[names(df) == "Freq"] <- "n"
+
+  ggplot(df, aes(condition, n, fill = site_class)) +
+    geom_col(width = 0.65) +
+    scale_fill_manual(values = hcl.colors(length(unique(df$site_class)),
+                                          "Zissou 1"),
+                      name = "site class") +
+    labs(x = NULL, y = "detected sites",
+         title = sprintf("Sites detected in >=%d replicates", min_reps)) +
+    theme_a2i
+}
+
+# ---- 3c. replicate sharing ------------------------------------
+
+a2i_gg_sharing <- function(pr) {
+  conds <- colnames(pr$n_detected)
+  mx <- max(pr$n_detected)
+  df <- do.call(rbind, lapply(conds, function(cn) {
+    tb <- as.data.frame(table(n_reps = factor(pr$n_detected[, cn],
+                                              levels = 0:mx)),
+                        stringsAsFactors = FALSE)
+    tb$condition <- cn
+    tb
+  }))
+  names(df)[names(df) == "Freq"] <- "n"
+  df$n_reps <- as.integer(as.character(df$n_reps))
+
+  ggplot(df, aes(factor(n_reps), n, fill = condition)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+    geom_vline(xintercept = MIN_REPS + 0.5,
+               linetype = "dashed", colour = "grey40") +
+    scale_fill_manual(values = c("#2C7FB8", "#D7301F")) +
+    labs(x = "replicates with the site detected", y = "sites",
+         title = "Replicate sharing",
+         subtitle = "dashed line marks the cutoff") +
+    theme_a2i
+}
+
+# ---- 4. editing level distribution ----------------------------
+
+a2i_gg_density <- function(pr, keep = NULL) {
+  m <- pr$mean_edit
+  if (is.null(keep)) keep <- rep(TRUE, nrow(m))
+  df <- do.call(rbind, lapply(colnames(m), function(cn) {
+    v <- m[keep, cn]
+    v <- v[is.finite(v) & v > 0]
+    if (!length(v)) return(NULL)
+    data.frame(condition = cn, edit = v, stringsAsFactors = FALSE)
+  }))
+
+  ggplot(df, aes(edit, colour = condition, fill = condition)) +
+    geom_density(alpha = 0.2, linewidth = 0.8) +
+    scale_x_log10() +
+    scale_colour_manual(values = c("#2C7FB8", "#D7301F")) +
+    scale_fill_manual(values = c("#2C7FB8", "#D7301F")) +
+    labs(x = "editing proportion (log scale)", y = "density",
+         title = "Editing level distribution",
+         subtitle = "detected sites only; the mass at zero is not shown") +
+    theme_a2i
+}
+
+# ---- run -------------------------------------------------------
+pr   <- a2i_prep(counts)
+keep <- a2i_keep(pr)
+#
+#ggsave("scatter.png",  a2i_gg_scatter(pr, keep),  width = 10, height = 4.5, dpi = 150)
+#ggsave("ma.png",       a2i_gg_ma(pr, keep),       width = 6,  height = 4.5, dpi = 150)
+#ggsave("cascade.png",  a2i_gg_cascade(pr),        width = 5.5, height = 4.5, dpi = 150)
+#ggsave("byclass.png",  a2i_gg_by_class(pr),       width = 6,  height = 4.5, dpi = 150)
+#ggsave("sharing.png",  a2i_gg_sharing(pr),        width = 7,  height = 4.5, dpi = 150)
+#ggsave("density.png",  a2i_gg_density(pr, keep),  width = 6,  height = 4.5, dpi = 150)
+#
+# With patchwork installed you can compose a single panel:
+library(patchwork)
+(a2i_gg_cascade(pr) | a2i_gg_by_class(pr)) / a2i_gg_scatter(pr, keep)
+```
+
+```{r true KO effect after filtering}
+# Ground truth for the sites that survive the filter
+shift_col <- "de_logit_shift_conditionADAR1KO_IFNb"
+
+si      <- pr$site_info     # the site table that was actually simulated
+si_kept <- si[keep, ]       # only sites that passed the filter
+
+# Numbers for the subtitle
+n_total     <- nrow(si)
+n_diff_all  <- sum(si[[shift_col]] != 0)
+n_kept      <- nrow(si_kept)
+n_diff_kept <- sum(si_kept[[shift_col]] != 0)
+
+shift_df <- data.frame(
+  shift      = si_kept[[shift_col]],
+  site_class = si_kept$site_class
+)
+shift_df <- shift_df[shift_df$shift != 0, ]
+
+truth_IFNb <- ggplot(shift_df, aes(shift)) +
+  geom_histogram(bins = 40, fill = "grey40") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(title = "True editing shift after filtering, ADAR1KO_IFNb vs WT_IFNb",
+       subtitle = sprintf("%d of %d kept sites are differentially edited (%d differential sites before filtering)",
+                          n_diff_kept, n_kept, n_diff_all),
+       x = "de_logit_shift (KO - WT, logit scale)", y = "number of sites") +
+  theme_minimal(base_size = 11)
+
+truth_IFNb
+ggsave("truth_IFNb_filtered.png", truth_IFNb, width = 6, height = 4.5, dpi = 150)
+```
+
+

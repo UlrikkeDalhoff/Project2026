@@ -1,0 +1,720 @@
+---
+title: "Power_curves_IFNb"
+output: html_document
+date: "2026-09-21"
+---
+
+<!--
+WHAT A POWER CURVE IS, IN PLAIN TERMS
+
+Right now you run the pipeline once and get one number per method, e.g.
+"quasibinomial recall = 0.62". That is one dot.
+
+A power curve is that same dot, computed again and again at different
+settings, and joined into a line. x = the setting you varied, y = the
+metric, one line per method.
+
+So to draw it you need a table shaped like this, one row per
+(setting, seed, method):
+
+   n_reps  seed  method              recall  precision  accuracy  AUC
+   3       1     GLM quasibinomial   0.21    0.94       0.88      0.79
+   3       1     Fisher (pooled)     0.55    0.48       0.71      0.81
+   5       1     GLM quasibinomial   0.38    0.95       0.90      0.84
+   ...
+
+Everything below exists to build that table. The plotting itself is
+three lines at the very end.
+
+NEEDS: p, f0 from your main script, and evaluate() / auc() / adj()
+from section 5 of the stats file.
+-->
+
+```{r libraries}
+# ----------------------------------------------------------------
+library(A2iSimR, lib.loc = "R_library")
+packageVersion("A2iSimR")
+library(ggplot2)
+
+```
+
+
+```{r preparation}
+# -----------------------------------------------------------------
+# 0. prep everything before creating the pipeline
+
+p <- a2i_calibrated_params("HEK293T__joint_condition_primary")
+
+f0 <- a2i_make_features(p, n_transcripts = 4000, n_sites = 10000, seed = 101)
+
+# ------------------------------------------------------------------
+# 5. SCORE THE METHODS
+# ------------------------------------------------------------------
+
+# Multiple testing: you ran thousands of tests, so 5% of null sites would
+# hit p < 0.05 by luck alone. Benjamini-Hochberg converts p-values into
+# q-values, which you can threshold at 0.05 to target a 5% false
+# discovery rate.
+adj <- function(p) stats::p.adjust(p, method = "BH")
+
+# Area under the ROC curve, computed from ranks (no extra package).
+# 1.0 = perfect ranking, 0.5 = coin flip.
+auc <- function(p, truth) {
+  #the p is for p-values, truth is for true values
+  ok <- is.finite(p)
+  p <- p[ok]; truth <- truth[ok]
+  if (!any(truth) || all(truth)) return(NA_real_)
+  score <- -p                       # smaller p = stronger evidence
+  r  <- rank(score)                 # rank() averages ties, which is correct
+  #Mann–Whitney U statistic
+  n1 <- sum(truth); n0 <- sum(!truth)
+  (sum(r[truth]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+auprc <- function(p, truth) {
+  ok <- is.finite(p)
+  p <- p[ok]; truth <- truth[ok]
+  n1 <- sum(truth)
+  if (n1 == 0 || n1 == length(truth)) return(NA_real_)
+
+  o <- order(p)                       # smallest p = strongest evidence first
+  p <- p[o]; truth <- truth[o]
+
+  tp <- cumsum(truth)
+  fp <- cumsum(!truth)
+
+  # Tied p-values (e.g. many p = 1) must enter together, so only
+  # evaluate the curve at the last site of each block of ties.
+  last <- c(p[-1] != p[-length(p)], TRUE)
+  tp <- tp[last]; fp <- fp[last]
+
+  precision <- tp / (tp + fp)
+  recall    <- tp / n1
+
+  sum(diff(c(0, recall)) * precision)
+}
+
+
+
+# ---- the four metrics -------------------------------------------
+#
+# Every site falls into one of four boxes once a method has called it:
+#
+#                        truly differential   truly null
+#   called significant          TP                FP
+#   not called                  FN                TN
+#
+#   accuracy  = (TP + TN) / everything
+#               "how often was the method right, either way"
+#   precision = TP / (TP + FP)
+#               "of the sites it called, how many were real"   (= 1 - FDR)
+#   recall    = TP / (TP + FN)
+#               "of the real sites, how many did it find"      (= power)
+#   AUC       = how well the p-values RANK true sites above null ones,
+#               across every possible cutoff. It needs no cutoff at all.
+#
+# accuracy, precision and recall all depend on where you put the cutoff
+# (here: BH q < 0.05). AUC does not.
+
+evaluate <- function(p, truth, alpha = 0.05) {
+  ok    <- is.finite(p)                 # sites the method could actually test
+  q     <- adj(p)
+  hit   <- ok & is.finite(q) & q < alpha # called significant
+  t_ok  <- truth[ok]
+  h_ok  <- hit[ok]
+
+  TP <- sum( h_ok &  t_ok)
+  FP <- sum( h_ok & !t_ok)
+  FN <- sum(!h_ok &  t_ok)
+  TN <- sum(!h_ok & !t_ok)
+
+  precision <- if (TP + FP > 0) TP / (TP + FP) else NA_real_
+  recall    <- if (TP + FN > 0) TP / (TP + FN) else NA_real_
+
+  data.frame(
+    tested    = sum(ok),
+    called    = TP + FP,
+    called_raw = sum(ok & p < alpha),
+    accuracy  = (TP + TN) / (TP + TN + FP + FN),
+    AUC       = auc(p, truth),
+    AUPRC          = auprc(p, truth),
+    AUPRC_baseline = mean(truth[ok]),
+    precision = precision,
+    recall    = recall,
+    # F1 is the balance between precision and recall - handy as a single
+    # number when one method wins on precision and another on recall.
+    F1        = if (is.finite(precision) && is.finite(recall) &&
+                    precision + recall > 0) {
+                  2 * precision * recall / (precision + recall)
+                } else NA_real_,
+    # balanced accuracy = average of recall and specificity. Plain accuracy
+    # is misleading here (see note below); this one is not.
+    balanced_accuracy   = mean(c(recall, if (TN + FP > 0) TN / (TN + FP) else NA_real_)),
+    TP = TP,
+    FP = FP,
+    FN = FN,
+    TN = TN
+  )
+}
+
+auprc_baseline <- function(dat, xvar) {
+  stopifnot(is.data.frame(dat),
+            all(c("method", xvar, "AUPRC_baseline") %in% names(dat)))
+  b <- aggregate(dat["AUPRC_baseline"],
+                 by = dat[c("method", xvar)], FUN = mean, na.rm = TRUE)
+  names(b)[names(b) == "AUPRC_baseline"] <- "value"
+  b$metric <- factor("AUPRC",
+                     levels = c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy"))
+  geom_line(data = b, linetype = "dashed", linewidth = 0.5)
+}
+
+
+```
+
+```{r ground truth}
+si <- f0$site_info
+n_total <- nrow(si)
+
+shift_ko_vs_wtifn <- si$de_logit_shift_conditionADAR1KO_IFNb -
+                     si$de_logit_shift_conditionWT_IFNb
+
+is_diff <- abs(shift_ko_vs_wtifn) > 1e-8   # tolerance instead of != 0
+n_diff  <- sum(is_diff)
+
+shift_df <- data.frame(
+  shift      = shift_ko_vs_wtifn[is_diff],
+  site_class = si$site_class[is_diff]
+)
+
+truth_IFNb <- ggplot(shift_df, aes(shift)) +
+  geom_histogram(bins = 40, fill = "grey40") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(title = "True editing shift, ADAR1KO_IFNb vs WT_IFNb",
+       subtitle = sprintf("%d differentially edited sites out of %d sites in total",
+                          n_diff, n_total),
+       x = "logit shift (KO_IFNb - WT_IFNb)", y = "number of sites") +
+  theme_minimal(base_size = 11)
+
+ggsave("truth_IFNb.png",  truth_IFNb,  width = 6,  height = 4.5, dpi = 150)
+truth_IFNb
+```
+
+
+
+```{r wrap}
+# ------------------------------------------------------------------
+# 1. Wrap the WHOLE pipeline into one function
+#
+# Every argument has a default equal to your baseline scenario. When you
+# sweep one parameter, you pass only that one and the rest stay at
+# baseline automatically. That is the answer to "how do I know the
+# setting of the parameters I am not testing" - they are written here,
+# once, and never move.
+# ------------------------------------------------------------------
+
+run_one <- function(n_reps       = 3,     # <- baseline values
+                    strength     = 1,
+                    target_depth = 100,
+                    phi          = 50,
+                    seed         = 1,
+                    use_fisher   = TRUE) {
+
+  # ---- (a) build the scenario, exactly as in your main script -------
+  f <- f0
+
+  # scale only the WT_IFNb vs ADAR1KO_IFNb contrast; WT_IFNb itself stays fixed
+  si0 <- f0$site_info
+  wt  <- si0$de_logit_shift_conditionWT_IFNb
+  ko  <- si0$de_logit_shift_conditionADAR1KO_IFNb
+  f$site_info$de_logit_shift_conditionADAR1KO_IFNb <- wt + strength * (ko - wt)
+
+  f$site_info$editing_sampling_model <- "beta_binomial"
+  f$site_info$precision              <- phi
+  f$transcript_info$baseline_expr    <- 1000
+  f$site_info$site_depth_multiplier  <- target_depth / 1000
+  f$site_info$coverage_fraction      <- f$site_info$site_depth_multiplier
+
+  # R copies p when you modify it inside a function, so the global p is
+  # left untouched. Safe.
+  pp <- p
+  pp$design$lib_condition_scale[] <- 1
+  pp$design$lib_sdlog <- 0
+
+  # ---- (b) simulate --------------------------------------------------
+  sim <- a2i_simulate(pp,
+                      transcript_info = f$transcript_info,
+                      site_info       = f$site_info,
+                      n_per_condition = c(WT_IFNb      = n_reps,
+                                          ADAR1KO_IFNb = n_reps),
+                      seed = seed)
+
+  counts <- a2i_refalt_counts(sim)
+  # ---- (c) filter ----------------------------------------------------
+  cond <- as.character(counts$sample_info$condition)
+  iA <- which(cond == "WT_IFNb"); iB <- which(cond == "ADAR1KO_IFNb")
+  dep <- counts$alt + counts$ref
+  #we want at least 10 reads that gives us any information
+  usable   <- dep >= 10
+  #Out of those 10 at least 2 has to be altered
+  detected <- usable & counts$alt >= 2
+
+  pr_ <- counts$alt / dep; pr_[dep == 0] <- NA
+  n_det_A <- rowSums(detected[, iA, drop = FALSE])
+  n_det_B <- rowSums(detected[, iB, drop = FALSE])
+  me_A <- rowSums(pr_[, iA, drop = FALSE] * usable[, iA, drop = FALSE], na.rm = TRUE) /
+          pmax(rowSums(usable[, iA, drop = FALSE]), 1)
+  me_B <- rowSums(pr_[, iB, drop = FALSE] * usable[, iB, drop = FALSE], na.rm = TRUE) /
+          pmax(rowSums(usable[, iB, drop = FALSE]), 1)
+
+  keep <- pmax(n_det_A, n_det_B) >= 2 & pmax(me_A, me_B) >= 0.10
+
+  alt <- counts$alt[keep, , drop = FALSE]
+  ref <- counts$ref[keep, , drop = FALSE]
+  si  <- counts$site_info[keep, , drop = FALSE]
+  dep <- alt + ref
+
+  true_diff <- si$de_logit_shift_conditionADAR1KO_IFNb -
+               si$de_logit_shift_conditionWT_IFNb
+  truth <- si$editable & true_diff != 0
+  grp   <- factor(cond, levels = c("WT_IFNb", "ADAR1KO_IFNb"))
+
+  # If a scenario has no true positives (strength = 0) or no sites left,
+  # bail out cleanly rather than crashing the whole loop.
+  if (nrow(alt) == 0) return(NULL)
+
+  # ---- (d) the four tests -------------------------------------------
+  prop <- alt / dep; prop[dep == 0] <- NA
+  eps <- 0.005
+  lgt <- log((alt + 0.5) / (ref + 0.5))
+
+  p_ttest <- apply(lgt, 1, function(v) {
+    x <- v[iA]; y <- v[iB]
+    x <- x[is.finite(x)]; y <- y[is.finite(y)]
+    if (length(x) < 2 || length(y) < 2) return(NA_real_)
+    if (stats::sd(c(x, y)) == 0) return(1)
+    stats::t.test(x, y)$p.value
+  })
+  
+  if (use_fisher) {
+    a1 <- rowSums(alt[, iA, drop = FALSE]); r1 <- rowSums(ref[, iA, drop = FALSE])
+    a2 <- rowSums(alt[, iB, drop = FALSE]); r2 <- rowSums(ref[, iB, drop = FALSE])
+    p_fisher <- vapply(seq_along(a1), function(i) {
+      m <- matrix(c(a1[i], a2[i], r1[i], r2[i]), nrow = 2)
+      if (any(rowSums(m) == 0)) return(NA_real_)
+      stats::fisher.test(m)$p.value
+    }, numeric(1))
+  } else p_fisher <- rep(NA_real_, nrow(alt))
+
+  #fit_p <- function(a, r, fam) {
+  #  tryCatch({
+  #    m  <- stats::glm(cbind(a, r) ~ grp, family = fam)
+  #    co <- summary(m)$coefficients
+  #    if (nrow(co) < 2) NA_real_ else co[2, 4]
+  #  }, error = function(e) NA_real_, warning = function(w) NA_real_)
+  #}
+  
+  fit_p <- function(a, r, fam) {
+  tryCatch({
+    m <- suppressWarnings(stats::glm(cbind(a, r) ~ grp, family = fam))
+    test <- if (identical(fam$family, "binomial")) "Chisq" else "F"
+    a_tab <- stats::anova(m, test = test)
+    if (nrow(a_tab) < 2) NA_real_ else a_tab[2, ncol(a_tab)]
+  }, error = function(e) NA_real_)
+}
+  
+  p_binom <- vapply(seq_len(nrow(alt)),
+                    function(i) fit_p(alt[i, ], ref[i, ], stats::binomial()),
+                    numeric(1))
+  p_quasi <- vapply(seq_len(nrow(alt)),
+                    function(i) fit_p(alt[i, ], ref[i, ], stats::quasibinomial()),
+                    numeric(1))
+
+  # ---- (e) score, and tag every row with the settings used ----------
+  # This tagging is the important bit: without it you cannot tell which
+  # row came from which setting once everything is stacked together.
+  out <- rbind(
+    cbind(method = "t-test (logit)",    evaluate(p_ttest,  truth)),
+    cbind(method = "Fisher (pooled)",   evaluate(p_fisher, truth)),
+    cbind(method = "GLM binomial",      evaluate(p_binom,  truth)),
+    cbind(method = "GLM quasibinomial", evaluate(p_quasi,  truth))
+  )
+  cbind(out,
+        n_reps = n_reps, strength = strength,
+        target_depth = target_depth, phi = phi, seed = seed,
+        row.names = NULL)
+}
+
+# Try it once to check it works before looping.
+run_one(seed = 1)
+```
+
+
+```{r rotate over parameters}
+# ------------------------------------------------------------------
+# 2. Sweep ONE parameter, repeat over several seeds
+#
+# expand.grid builds every combination of the values you give it. Here:
+# 4 replicate counts x 3 seeds = 12 runs. lapply walks the rows, and
+# do.call(rbind, ...) stacks the 12 small tables into one big one.
+#
+# Three seeds is the minimum worth doing; 5-10 is better. One seed is a
+# single roll of the dice and will mislead you.
+# ------------------------------------------------------------------
+
+grid_reps <- expand.grid(n_reps = c(3, 5, 8, 12),
+                         seed   = 1:3)
+
+sweep_reps <- do.call(rbind, lapply(seq_len(nrow(grid_reps)), function(i) {
+  message("run ", i, " of ", nrow(grid_reps))   # progress, this is slow
+  run_one(n_reps = grid_reps$n_reps[i],
+          seed   = grid_reps$seed[i])
+  # everything else stays at the defaults written in run_one():
+  # strength = 1, target_depth = 100, phi = 50
+}))
+
+head(sweep_reps)
+```
+
+
+```{r}
+# ------------------------------------------------------------------
+# 3. Average over seeds
+#
+# You have 3 rows per (n_reps, method) - one per seed. Collapse them to
+# one mean, so the lines are steady instead of jagged.
+# aggregate() = "for each combination of method and n_reps, average these
+# columns".
+# ------------------------------------------------------------------
+
+avg_reps <- aggregate(cbind(balanced_accuracy, AUC, AUPRC, AUPRC_baseline, precision, recall) ~ method + n_reps,
+                      data = sweep_reps, FUN = mean, na.rm = TRUE,
+                      na.action = na.pass)
+#avg_reps
+```
+
+
+```{r}
+avg_reps_calls <- aggregate(cbind(TP, TN, FN, FP) ~ method + n_reps,
+                      data = sweep_reps, FUN = mean, na.rm = TRUE,
+                      na.action = na.pass)
+
+metrics <- c("TP", "TN", "FN", "FP")
+reps_calls <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method = avg_reps_calls$method,
+             n_reps = avg_reps_calls$n_reps,
+             metric = mm,
+             value  = avg_reps_calls[[mm]])
+}))
+# fix the panel order so precision and recall sit next to each other
+reps_calls$metric <- factor(reps_calls$metric,
+                           levels = c("TP", "TN", "FN", "FP"))
+
+calls_nreps_IFNb <- ggplot(reps_calls, aes(method, value, fill = metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ n_reps, labeller = label_both) +
+  labs(title = "Calls per test (n_reps sweep)",
+       subtitle = "strength = 1, depth = 100, phi = 50; mean of 3 seeds",
+       x = NULL, y = "number of sites", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("calls_nreps_IFNb.png",  calls_nreps_IFNb,  width = 6,  height = 4.5, dpi = 150)
+
+calls_nreps_IFNb
+```
+
+
+
+
+
+```{r plot n_reps}
+# ------------------------------------------------------------------
+# 4. PLOT
+#
+# ggplot wants LONG format: one row per point to be drawn, with a column
+# saying which metric it is. Right now accuracy/AUC/precision/recall are
+# four separate columns (wide format), so reshape first.
+#
+# After reshaping:
+#   x      = n_reps      (the thing you varied)
+#   y      = value       (the metric)
+#   colour = method      (one line per test)
+#   facet  = metric      (one small panel per metric)
+# ------------------------------------------------------------------
+
+# base-R way to go wide -> long: stack the four metric columns on top of
+# each other and keep a label saying which was which.
+metrics <- c("balanced_accuracy", "AUC", "AUPRC", "precision", "recall")
+lvls    <- c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy")
+
+long_reps <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method = avg_reps$method, n_reps = avg_reps$n_reps,
+             metric = mm, value = avg_reps[[mm]])
+}))
+
+long_reps$metric <- factor(long_reps$metric, levels = lvls)
+
+n_reps_sweep_IFNb <- ggplot(long_reps, aes(n_reps, value, colour = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  auprc_baseline(sweep_reps, "n_reps") +
+  facet_wrap(~metric) +
+  ylim(0, 1) +
+  labs(title = "Effect of replicate number on each test",
+       subtitle = "strength = 1, depth = 100, phi = 50; mean of 3 seeds; dashed = AUPRC random baseline",
+       x = "replicates per condition", y = NULL) +
+  theme_minimal(base_size = 11)
+
+ggsave("nreps_sweep_IFNb.png",  n_reps_sweep_IFNb,  width = 6,  height = 4.5, dpi = 150)
+
+# WHAT TO LOOK FOR
+#  - the recall panel is the power curve. Fisher's line should be nearly
+#    flat: it pools reads and never sees replicates, so more replicates
+#    do not help it in the way they help the others.
+#  - the precision panel is the check. A line that sits below 0.95 is a
+#    method whose FDR control has failed. Fisher and binomial GLM should
+#    sit low; quasibinomial should hug 0.95.
+#  - read the two together. High recall on the Fisher line means nothing
+#    if its precision panel shows it was guessing.
+
+n_reps_sweep_IFNb
+```
+
+
+```{r}
+# ------------------------------------------------------------------
+# 5. The same thing for the other three knobs
+#
+# Identical pattern - only the swept column changes. The parameters you
+# are NOT sweeping simply are not passed, so run_one() uses its defaults.
+# ------------------------------------------------------------------
+
+# a small helper so you do not repeat yourself
+sweep_over <- function(param, values, seeds = 1:3) {
+  g <- expand.grid(value = values, seed = seeds)
+  do.call(rbind, lapply(seq_len(nrow(g)), function(i) {
+    args <- list(seed = g$seed[i])
+    args[[param]] <- g$value[i]          # set only the swept parameter
+    do.call(run_one, args)
+  }))
+}
+
+
+# and plot with the same three steps: aggregate -> reshape long -> ggplot,
+# swapping `n_reps` for `strength` / `target_depth` / `phi`.
+
+# NOTE on strength = 0: there are no true positives, so recall and
+# precision are undefined (NA) and only the false positive count is
+# meaningful. Report that run separately as a null check - "how many
+# sites did each method call when nothing was different" - rather than
+# as a point on the power curve.
+```
+
+```{r target_depth}
+# 1. run the sweep (strength, phi, n_reps stay at run_one() defaults)
+sweep_depth <- sweep_over("target_depth", c(20, 50, 100, 500))
+
+# 2. average over seeds
+avg_depth <- aggregate(cbind(balanced_accuracy, AUC, AUPRC, precision, recall) ~ method + target_depth,
+                       data = sweep_depth, FUN = mean, na.rm = TRUE,
+                       na.action = na.pass)
+
+
+metrics <- c("balanced_accuracy", "AUC", "AUPRC", "precision", "recall")
+lvls    <- c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy")
+
+# 3. wide -> long
+metrics <- c("balanced_accuracy", "AUC", "AUPRC", "precision", "recall")
+long_depth <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method       = avg_depth$method,
+             target_depth = avg_depth$target_depth,
+             metric       = mm,
+             value        = avg_depth[[mm]])
+}))
+long_depth$metric <- factor(long_depth$metric,
+                            levels = c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy"))
+
+# 4. plot
+depth_sweep_IFNb <- ggplot(long_depth, aes(target_depth, value, colour = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  facet_wrap(~metric) +
+  auprc_baseline(sweep_depth, "target_depth") + 
+  scale_x_log10() +              # 20, 50, 100, 500 spread out evenly
+  ylim(0, 1) +
+  labs(title = "Effect of sequencing depth on each test",
+       subtitle = "n_reps = 3, strength = 1, phi = 50; mean of 3 seeds",
+       x = "target depth", y = NULL) +
+  theme_minimal(base_size = 11)
+
+ggsave("depth_sweep_IFNb.png",  depth_sweep_IFNb,  width = 6,  height = 4.5, dpi = 150)
+depth_sweep_IFNb
+```
+
+```{r}
+avg_depth_calls <- aggregate(cbind(TP, TN, FN, FP) ~ method + target_depth,
+                      data = sweep_depth, FUN = mean, na.rm = TRUE,
+                      na.action = na.pass)
+
+metrics <- c("TP", "TN", "FN", "FP")
+depth_calls <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method = avg_depth_calls$method,
+             target_depth = avg_depth_calls$target_depth,
+             metric = mm,
+             value  = avg_depth_calls[[mm]])
+}))
+# fix the panel order so precision and recall sit next to each other
+depth_calls$metric <- factor(depth_calls$metric,
+                           levels = c("TP", "TN", "FN", "FP"))
+
+calls_depth_IFNb <- ggplot(depth_calls, aes(method, value, fill = metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ target_depth, labeller = label_both) +
+  labs(title = "Calls per test (depth sweep)",
+       subtitle = "n_reps = 3, strength = 1, phi = 50; mean of 3 seeds",
+       x = NULL, y = "number of sites", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("calls_depth_IFNb.png",  calls_depth_IFNb,  width = 6,  height = 4.5, dpi = 150)
+calls_depth_IFNb
+```
+
+
+
+```{r strength}
+# 1. run the sweep (strength, phi, n_reps stay at run_one() defaults)
+sweep_strength <- sweep_over("strength", c(0.5, 1, 2))
+
+# 2. average over seeds
+avg_strength <- aggregate(cbind(balanced_accuracy, AUC, AUPRC, precision, recall) ~ method + strength,
+                       data = sweep_strength, FUN = mean, na.rm = TRUE,
+                       na.action = na.pass)
+
+# 3. wide -> long
+metrics <- c("balanced_accuracy", "AUC", "AUPRC", "precision", "recall")
+long_strength <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method       = avg_strength$method,
+             strength = avg_strength$strength,
+             metric       = mm,
+             value        = avg_strength[[mm]])
+}))
+long_strength$metric <- factor(long_strength$metric,
+                            levels = c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy"))
+
+# 4. plot
+strength_sweep_IFNb <- ggplot(long_strength, aes(strength, value, colour = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  auprc_baseline(sweep_strength, "strength") +
+  facet_wrap(~metric) +
+  scale_x_log10() +             
+  ylim(0, 1) +
+  labs(title = "Effect of effect size (strength)",
+       subtitle = "n_reps = 3, depth = 100, phi = 50; mean of 3 seeds",
+       x = "strength", y = NULL) +
+  theme_minimal(base_size = 11)
+
+ggsave("strength_sweep_IFNb.png",  strength_sweep_IFNb,  width = 6,  height = 4.5, dpi = 150)
+strength_sweep_IFNb
+```
+
+```{r}
+avg_strength_calls <- aggregate(cbind(TP, TN, FN, FP) ~ method + strength,
+                      data = sweep_strength, FUN = mean, na.rm = TRUE,
+                      na.action = na.pass)
+
+metrics <- c("TP", "TN", "FN", "FP")
+strength_calls <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method = avg_strength_calls$method,
+             strength = avg_strength_calls$strength,
+             metric = mm,
+             value  = avg_strength_calls[[mm]])
+}))
+# fix the panel order so precision and recall sit next to each other
+strength_calls$metric <- factor(strength_calls$metric,
+                           levels = c("TP", "TN", "FN", "FP"))
+
+calls_strength_IFNb <- ggplot(strength_calls, aes(method, value, fill = metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ strength, labeller = label_both) +
+  labs(title = "Calls per test (strength sweep)",
+       subtitle = "n_reps = 3, depth = 100, phi = 50; mean of 3 seeds",
+       x = NULL, y = "number of sites", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("calls_strength_IFNb.png",  calls_strength_IFNb,  width = 6,  height = 4.5, dpi = 150)
+calls_strength_IFNb
+```
+
+
+
+```{r phi}
+# 1. run the sweep (strength, phi, n_reps stay at run_one() defaults)
+sweep_phi <- sweep_over("phi", c(25, 50, 100, 300, 500, 1000, 2000))
+
+# 2. average over seeds
+avg_phi <- aggregate(cbind(balanced_accuracy, AUC, AUPRC, precision, recall) ~ method + phi,
+                    data = sweep_phi, FUN = mean, na.rm = TRUE, 
+                     na.action = na.pass)
+
+# 3. wide -> long
+metrics <- c("balanced_accuracy", "AUC", "AUPRC", "precision", "recall")
+long_phi <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method       = avg_phi$method,
+             phi = avg_phi$phi,
+             metric       = mm,
+             value        = avg_phi[[mm]])
+}))
+long_phi$metric <- factor(long_phi$metric,
+                            levels = c("recall", "precision", "AUC", "AUPRC", "balanced_accuracy"))
+
+# 4. plot
+phi_sweep_IFNb <- ggplot(long_phi, aes(phi, value, colour = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  auprc_baseline(sweep_phi, "phi") +
+  facet_wrap(~metric) +
+  scale_x_log10() +             
+  ylim(0, 1) +
+  labs(title = "Effect of replicate precision φ",
+       subtitle = "n_reps = 3, depth = 100, strength = 1; mean of 3 seeds",
+       x = "phi", y = NULL) +
+  theme_minimal(base_size = 11)
+
+ggsave("phi_sweep_IFNb.png",  phi_sweep_IFNb,  width = 6,  height = 4.5, dpi = 150)
+phi_sweep_IFNb
+```
+
+
+```{r}
+avg_phi_calls <- aggregate(cbind(TP, TN, FN, FP) ~ method + phi,
+                      data = sweep_phi, FUN = mean, na.rm = TRUE,
+                      na.action = na.pass)
+
+metrics <- c("TP", "TN", "FN", "FP")
+phi_calls <- do.call(rbind, lapply(metrics, function(mm) {
+  data.frame(method = avg_phi_calls$method,
+             phi = avg_phi_calls$phi,
+             metric = mm,
+             value  = avg_phi_calls[[mm]])
+}))
+# fix the panel order so precision and recall sit next to each other
+phi_calls$metric <- factor(phi_calls$metric,
+                           levels = c("TP", "TN", "FN", "FP"))
+
+calls_phi_IFNb <- ggplot(phi_calls, aes(method, value, fill = metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ phi, labeller = label_both) +
+  labs(title = "Calls per test (phi sweep)",
+       subtitle = "n_reps = 3, strength = 1, depth = 100; mean of 3 seeds",
+       x = NULL, y = "number of sites", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("calls_phi_IFNb.png",  calls_phi_IFNb,  width = 6,  height = 4.5, dpi = 150)
+calls_phi_IFNb
+```
+
+

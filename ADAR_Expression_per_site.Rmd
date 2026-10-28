@@ -1,0 +1,513 @@
+---
+title: "editing_levels"
+output: html_document
+date: "2026-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/Users/ulrikke/Desktop/Final_project")
+```
+
+
+```{r}
+library(A2iSimR, lib.loc = "R_library")
+packageVersion("A2iSimR")
+```
+
+```{r}
+p <- a2i_calibrated_params("HEK293T__joint_condition_primary")
+f0 <- a2i_make_features(p, n_transcripts = 4000, n_sites = 10000, seed = 101)
+```
+
+```{r}
+f <- f0                       # reset FIRST
+n_reps       <- 8
+strength     <- 1
+adar_strength <- 0.5
+adar_shift   <- 1
+target_depth <- 100
+phi          <- 50
+
+# condition effects
+for (cond in c("WT_IFNb", "ADAR1KO_mock", "ADAR1KO_IFNb",
+               "ADAR1p150KO_mock", "ADAR1p150KO_IFNb")) {
+  col <- paste0("de_logit_shift_condition", cond)
+  f$site_info[[col]] <- strength * f0$site_info[[col]]
+}
+
+# ADAR modifier
+p$design$modifier_effect_mode <- "full"
+p$design$adar_sd["ADAR"] <- 1
+f$site_info$modifier_active_ADAR <- f$site_info$editable
+f$site_info$modifier_slope_ADAR  <- adar_strength * as.numeric(f$site_info$editable)
+f$site_info$adar_sensitive       <- f$site_info$editable
+p$design$adar_condition_shift[c("WT_mock", "WT_IFNb"), "ADAR"] <- c(0, adar_shift)
+
+# sampling / depth
+f$site_info$editing_sampling_model <- "beta_binomial"
+f$site_info$precision <- phi
+f$transcript_info$baseline_expr <- 1000
+f$site_info$site_depth_multiplier <- target_depth / 1000
+f$site_info$coverage_fraction <- f$site_info$site_depth_multiplier
+
+p$design$lib_condition_scale[] <- 1
+p$design$lib_sdlog <- 0
+```
+
+```{r}
+sim <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_mock = n_reps, ADAR1KO_mock = n_reps), seed = 102)
+
+counts <- a2i_long_counts(sim)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts$ADAR_effect_z <- sim$sample_info$ADAR_effect_z[
+  match(counts$sample_id, sim$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts   <- subset(counts,   editable & depth > 0)
+counts$condition   <- factor(counts$condition,   levels = c("WT_mock", "ADAR1KO_mock"))
+
+
+fit1 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts)
+fit2 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts)
+summary(fit2)
+```
+
+
+```{r}
+summary(sim$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim$sample_info$ADAR_effect_z, sim$sample_info$condition, mean)
+```
+
+
+```{r}
+sim2 <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_IFNb = n_reps, ADAR1KO_IFNb = n_reps), seed = 102)
+
+counts_2 <- a2i_long_counts(sim2)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts_2$ADAR_effect_z <- sim2$sample_info$ADAR_effect_z[
+  match(counts_2$sample_id, sim2$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts_2 <- subset(counts_2, editable & depth > 0)
+counts_2$condition <- factor(counts_2$condition, levels = c("WT_IFNb", "ADAR1KO_IFNb"))
+
+
+fit1_2 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts_2)
+fit2_2 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts_2)
+summary(fit2_2)
+```
+
+```{r}
+summary(sim2$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim2$sample_info$ADAR_effect_z, sim2$sample_info$condition, mean)
+```
+
+
+```{r}
+sim3 <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_mock = n_reps, WT_IFNb = n_reps), seed = 102)
+
+counts_3 <- a2i_long_counts(sim3)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts_3$ADAR_effect_z <- sim3$sample_info$ADAR_effect_z[
+  match(counts_3$sample_id, sim3$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts_3 <- subset(counts_3, editable & depth > 0)
+counts_3$condition <- factor(counts_3$condition, levels = c("WT_mock", "WT_IFNb"))
+
+fit1_3 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts_3)
+fit2_3 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts_3)
+summary(fit2_3)
+```
+
+
+```{r}
+summary(sim3$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim3$sample_info$ADAR_effect_z, sim3$sample_info$condition, mean)
+```
+
+
+
+Plotting of the ADAR expression and editing levels of the four conditions 
+
+
+```{r}
+library(ggplot2)
+```
+
+```{r}
+#The four condtions 
+cond_order <- c("WT_mock", "WT_IFNb", "ADAR1KO_mock", "ADAR1KO_IFNb", "p150KO_mock", "p150KO_IFNb")
+
+#Simulation with all four conditions
+sim4 <- a2i_simulate(p,
+                     transcript_info = f$transcript_info, site_info = f$site_info,
+                     n_per_condition = setNames(rep(n_reps, 6), cond_order), seed = 102)
+
+#Make the counts
+counts4 <- a2i_long_counts(sim4)
+counts4$condition <- factor(counts4$condition, levels = cond_order)
+
+```
+
+
+Per sample summary
+
+```{r}
+#editing level per sample = total G reads / total reads over editable sites
+ed <- subset(counts4, editable & depth > 0)
+
+sample_edit <- aggregate(cbind(alt_count, depth) ~ sample_id, data = ed, FUN = sum)
+
+sample_edit$editing <- sample_edit$alt_count / sample_edit$depth
+
+samples <- sim4$sample_info[, c("sample_id", "condition", "ADAR", "ADAR_effect_z")]
+
+samples$condition <- factor(samples$condition, levels = cond_order)
+
+samples <- merge(samples, sample_edit[, c("sample_id", "editing")], by = "sample_id")
+
+cond_cols <- c(WT_mock = "#4C72B0", WT_IFNb = "#55A868",
+               ADAR1KO_mock = "#C44E52", ADAR1KO_IFNb = "#DD8452", p150KO_mock = "yellow", 
+               p150KO_IFNb = "purple")
+
+
+```
+
+
+Plotting 
+
+```{r}
+p_adar <- ggplot(samples, aes(condition, ADAR, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.12, size = 2) +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Simulated ADAR expression", title = "ADAR expression") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+``` 
+
+```{r}
+# ---- Plot 2: global editing level per sample --------------------------------
+p_edit <- ggplot(samples, aes(condition, editing * 100, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.12, size = 2) +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Editing level (% G reads, editable sites)",
+       title = "Global editing level per sample") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+ 
+```
+
+
+```{r}
+# ---- Plot 3: per-site editing distribution ----------------------------------
+site_level <- subset(ed, depth >= 10)
+p_sites <- ggplot(site_level, aes(condition, edit_prop, fill = condition)) +
+  geom_violin(scale = "width", alpha = 0.6) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white") +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Editing proportion per site (depth >= 10)",
+       title = "Site-level editing") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+# ---- Plot 4: ADAR expression vs editing -------------------------------------
+p_scatter <- ggplot(samples, aes(ADAR, editing * 100, colour = condition)) +
+  geom_point(size = 3) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE, colour = "grey30") +
+  scale_colour_manual(values = cond_cols) +
+  labs(x = "Simulated ADAR expression", y = "Editing level (%)",
+       colour = NULL, title = "ADAR expression vs editing") +
+  theme_classic(base_size = 13)
+```
+
+```{r}
+p_adar
+p_edit
+p_sites
+p_scatter
+ 
+# Optional: all four in one figure (install.packages("patchwork") if needed)
+# library(patchwork)
+# (p_adar | p_edit) / (p_sites | p_scatter)
+
+
+ggsave("p_adar.png", p_adar, width = 6, height = 4.5, dpi = 150)
+ggsave("p_edit.png", p_edit, width = 6, height = 4.5, dpi = 150)
+ggsave("p_sites.png", p_sites, width = 6, height = 4.5, dpi = 150)
+ggsave("p_scatter.png", p_scatter, width = 6, height = 4.5, dpi = 150)
+```
+
+
+```{r}
+get_row <- function(name, fit1, fit2) {
+  c1 <- coef(summary(fit1)); c2 <- coef(summary(fit2))
+  cond <- grep("^condition", rownames(c1), value = TRUE)
+  data.frame(comparison       = name,
+             coefficient      = cond,
+             beta1_cond_only  = c1[cond, "Estimate"],
+             p_beta1_cond_only = c1[cond, "Pr(>|t|)"],
+             beta1_with_ADAR  = c2[cond, "Estimate"],
+             p_beta1_with_ADAR = c2[cond, "Pr(>|t|)"],
+             beta2_ADAR       = c2["ADAR_effect_z", "Estimate"],
+             se_beta2         = c2["ADAR_effect_z", "Std. Error"],
+             p_beta2          = c2["ADAR_effect_z", "Pr(>|t|)"],
+             dispersion       = summary(fit2)$dispersion)
+}
+
+res <- rbind(get_row("WT_mock vs ADAR1KO_mock", fit1,   fit2),
+             get_row("WT_IFNb vs ADAR1KO_IFNb", fit1_2, fit2_2),
+             get_row("WT_mock vs WT_IFNb",      fit1_3, fit2_3))
+print(res, digits = 3)
+```
+
+
+
+
+# Per-site analysis: WT_mock vs ADAR1KO_mock
+
+The global models above pool every site into one regression. Here the same two
+models are fitted **separately for every editable site**, using the `counts`
+object from the WT_mock vs ADAR1KO_mock simulation (`sim`), which already has
+`ADAR_effect_z` attached and is filtered to `editable & depth > 0`.
+
+For each site:
+
+* `m_cond`: `cbind(alt, ref) ~ condition` (same as `fit1`)
+* `m_full`: `cbind(alt, ref) ~ condition + ADAR_effect_z` (same as `fit2`)
+
+P-values come from drop-in-deviance F-tests between nested models rather than
+from the Wald t-tests in `summary()`. Many sites have zero G reads in every
+ADAR1KO sample (complete separation); there the coefficient runs off towards
+-20 and its Wald p-value is close to 1 even though the difference is huge.
+The F-test does not have that problem. Coefficients at such sites are flagged
+with `separation = TRUE` and should not be interpreted as effect sizes.
+
+```{r}
+# Column that identifies a site in a2i_long_counts() output - check names(counts)
+site_col <- "site_id"
+stopifnot(site_col %in% names(counts))
+counts$site_key <- counts[[site_col]]
+
+fit_one_site <- function(d, ko_level = "ADAR1KO_mock", min_reps = 2) {
+  # need enough samples in both conditions, and at least one G read
+  if (any(table(d$condition) < min_reps)) return(NULL)
+  if (sum(d$alt_count) == 0) return(NULL)
+
+  fit_q <- function(fml) suppressWarnings(
+    glm(fml, family = quasibinomial(), data = d))
+  m_cond <- fit_q(cbind(alt_count, ref_count) ~ condition)
+  m_adar <- fit_q(cbind(alt_count, ref_count) ~ ADAR_effect_z)
+  m_full <- fit_q(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z)
+
+  term <- paste0("condition", ko_level)
+  c1 <- coef(m_cond); c2 <- coef(m_full)
+  if (anyNA(c2[c(term, "ADAR_effect_z")])) return(NULL)   # aliased -> skip
+
+  p_F <- function(small, big)
+    suppressWarnings(anova(small, big, test = "F")[2, "Pr(>F)"])
+  is_wt <- d$condition != ko_level
+
+  data.frame(
+    site_key        = d$site_key[1],
+    mean_depth      = mean(d$depth),
+    edit_WT         = sum(d$alt_count[is_wt])  / sum(d$depth[is_wt]),
+    edit_KO         = sum(d$alt_count[!is_wt]) / sum(d$depth[!is_wt]),
+    beta1_cond_only = unname(c1[term]),
+    p_cond_only     = p_F(update(m_cond, . ~ 1), m_cond),  # condition, no ADAR
+    beta1_with_ADAR = unname(c2[term]),
+    p_cond_adj      = p_F(m_adar, m_full),                 # condition | ADAR
+    beta2_ADAR      = unname(c2["ADAR_effect_z"]),
+    p_ADAR          = p_F(m_cond, m_full),                 # ADAR | condition
+    dispersion      = summary(m_full)$dispersion,
+    separation      = any(fitted(m_full) < 1e-8 | fitted(m_full) > 1 - 1e-8)
+  )
+}
+
+# optional coverage filter, consistent with the site-level plot above
+counts_site <- subset(counts, depth >= 10)
+
+site_res <- do.call(rbind, lapply(split(counts_site, counts_site$site_key),
+                                  fit_one_site))
+rownames(site_res) <- NULL
+
+# multiple-testing correction across sites
+site_res$padj_cond_only <- p.adjust(site_res$p_cond_only, method = "BH")
+site_res$padj_cond_adj  <- p.adjust(site_res$p_cond_adj,  method = "BH")
+site_res$padj_ADAR      <- p.adjust(site_res$p_ADAR,      method = "BH")
+
+nrow(site_res)                                   # sites tested
+sum(site_res$separation)                         # sites with separation
+colSums(site_res[, c("padj_cond_only", "padj_cond_adj", "padj_ADAR")] < 0.05)
+summary(site_res$beta2_ADAR[!site_res$separation])
+```
+
+Per-site summary table, in the same spirit as `res` above:
+
+```{r}
+ok <- !site_res$separation
+site_summary <- data.frame(
+  n_sites                 = nrow(site_res),
+  n_separation            = sum(!ok),
+  n_sig_cond_only         = sum(site_res$padj_cond_only < 0.05),
+  n_sig_cond_with_ADAR    = sum(site_res$padj_cond_adj  < 0.05),
+  n_sig_ADAR              = sum(site_res$padj_ADAR      < 0.05),
+  median_beta1_cond_only  = median(site_res$beta1_cond_only[ok]),
+  median_beta1_with_ADAR  = median(site_res$beta1_with_ADAR[ok]),
+  median_beta2_ADAR       = median(site_res$beta2_ADAR[ok]),
+  median_dispersion       = median(site_res$dispersion)
+)
+print(site_summary, digits = 3)
+
+write.csv(site_res, "per_site_WTmock_vs_ADAR1KOmock.csv", row.names = FALSE)
+```
+
+Plots
+
+```{r}
+site_res$sig_cond <- ifelse(site_res$padj_cond_adj < 0.05, "FDR < 0.05", "n.s.")
+sig_cols <- c("FDR < 0.05" = "#C44E52", "n.s." = "grey70")
+
+# 1. WT vs KO editing per site
+p_site_scatter <- ggplot(site_res, aes(edit_WT * 100, edit_KO * 100, colour = sig_cond)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  geom_abline(linetype = "dashed") +
+  scale_colour_manual(values = sig_cols) +
+  coord_equal() +
+  labs(x = "Editing in WT_mock (%)", y = "Editing in ADAR1KO_mock (%)",
+       colour = NULL, title = "Per-site editing, WT vs ADAR1KO (mock)") +
+  theme_classic(base_size = 13)
+
+# 2. Volcano plot for the condition effect (adjusted for ADAR)
+#    separated sites are capped at -5 on the x axis and drawn as triangles
+site_res$beta1_plot <- pmax(site_res$beta1_with_ADAR, -5)
+p_volcano <- ggplot(site_res, aes(beta1_plot, -log10(padj_cond_adj),
+                                  colour = sig_cond, shape = separation)) +
+  geom_point(size = 1, alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_colour_manual(values = sig_cols) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17)) +
+  labs(x = "beta1: log-odds ADAR1KO vs WT (capped at -5)",
+       y = "-log10 FDR", colour = NULL, shape = "Separation",
+       title = "Per-site condition effect (adjusted for ADAR)") +
+  theme_classic(base_size = 13)
+
+# 3. Distribution of the per-site ADAR coefficient
+p_beta2 <- ggplot(subset(site_res, !separation), aes(beta2_ADAR)) +
+  geom_histogram(bins = 60, fill = "#4C72B0", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "beta2: ADAR_effect_z (log-odds per SD)", y = "Number of sites",
+       title = "Per-site ADAR effect") +
+  theme_classic(base_size = 13)
+
+# 4. How much does adjusting for ADAR change the condition effect?
+p_attenuation <- ggplot(subset(site_res, !separation),
+                        aes(beta1_cond_only, beta1_with_ADAR)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_abline(linetype = "dashed") +
+  labs(x = "beta1, condition only", y = "beta1, with ADAR_effect_z",
+       title = "Condition effect before vs after ADAR adjustment") +
+  theme_classic(base_size = 13)
+
+# 5. P-value histograms (should be flat + spike near 0)
+p_pvals <- ggplot(
+  rbind(data.frame(test = "condition | ADAR", p = site_res$p_cond_adj),
+        data.frame(test = "ADAR | condition", p = site_res$p_ADAR)),
+  aes(p)) +
+  geom_histogram(bins = 40, boundary = 0, fill = "grey50") +
+  facet_wrap(~ test) +
+  labs(x = "p-value", y = "Number of sites", title = "Per-site p-values") +
+  theme_classic(base_size = 13)
+
+p_site_scatter
+p_volcano
+p_beta2
+p_attenuation
+p_pvals
+
+#ggsave("p_site_scatter_mock.png", p_site_scatter, width = 6, height = 5,   dpi = 150)
+#ggsave("p_volcano_mock.png",      p_volcano,      width = 6, height = 4.5, dpi = 150)
+#ggsave("p_beta2_mock.png",        p_beta2,        width = 6, height = 4.5, dpi = 150)
+#ggsave("p_attenuation_mock.png",  p_attenuation,  width = 6, height = 4.5, dpi = 150)
+#ggsave("p_pvals_mock.png",        p_pvals,        width = 8, height = 4,   dpi = 150)
+```
+
+Optional: since the data are simulated, compare the per-site estimates with the
+true per-site values stored in `sim$site_info` (check `names(sim$site_info)` if
+the site ID column has a different name).
+
+```{r}
+truth <- sim$site_info[, c(site_col, "de_logit_shift_conditionADAR1KO_mock",
+                           "modifier_slope_ADAR")]
+names(truth) <- c("site_key", "true_cond_shift", "true_ADAR_slope")
+site_truth <- merge(site_res, truth, by = "site_key")
+
+# recovery of the condition effect (non-separated sites)
+with(subset(site_truth, !separation),
+     cor(beta1_with_ADAR, true_cond_shift))
+
+# power / false positives at FDR 5 %
+table(called = site_truth$padj_cond_adj < 0.05,
+      true_effect = site_truth$true_cond_shift != 0)
+
+p_truth <- ggplot(subset(site_truth, !separation),
+                  aes(true_cond_shift, beta1_with_ADAR)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_abline(linetype = "dashed") +
+  labs(x = "True logit shift (ADAR1KO_mock)", y = "Estimated beta1",
+       title = "Per-site estimate vs simulated truth") +
+  theme_classic(base_size = 13)
+p_truth
+```
+
+
+
+
+```{r}
+s <- site_res$site_key[which.min(site_res$p_cond_adj)]   # most significant site
+d <- subset(counts_site, site_key == s)
+d$logit_edit <- qlogis((d$alt_count + 0.5) / (d$depth + 1))
+
+m <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+         family = quasibinomial(), data = d)
+grid <- expand.grid(condition = levels(d$condition),
+                    ADAR_effect_z = seq(min(d$ADAR_effect_z), max(d$ADAR_effect_z), length.out = 50))
+grid$fit <- predict(m, newdata = grid)          # on the logit scale
+
+ggplot(d, aes(ADAR_effect_z, logit_edit, colour = condition)) +
+  geom_point(size = 3) +
+  geom_line(data = grid, aes(y = fit)) +
+  scale_colour_manual(values = cond_cols) +
+  labs(x = "ADAR_effect_z (per sample)", y = "Editing (log-odds)",
+       title = paste("Site", s)) +
+  theme_classic(base_size = 13)
+```
+

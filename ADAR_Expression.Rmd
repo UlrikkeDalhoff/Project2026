@@ -1,0 +1,291 @@
+---
+title: "editing_levels"
+output: html_document
+date: "2026-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/Users/ulrikke/Desktop/Final_project")
+```
+
+
+```{r}
+library(A2iSimR, lib.loc = "R_library")
+packageVersion("A2iSimR")
+```
+
+```{r}
+p <- a2i_calibrated_params("HEK293T__joint_condition_primary")
+f0 <- a2i_make_features(p, n_transcripts = 4000, n_sites = 10000, seed = 101)
+```
+
+```{r}
+f <- f0                       # reset FIRST
+n_reps       <- 8
+strength     <- 1
+adar_strength <- 0.5
+adar_shift   <- 1
+target_depth <- 100
+phi          <- 50
+
+# condition effects
+for (cond in c("WT_IFNb", "ADAR1KO_mock", "ADAR1KO_IFNb")) {
+  col <- paste0("de_logit_shift_condition", cond)
+  f$site_info[[col]] <- strength * f0$site_info[[col]]
+}
+
+# ADAR modifier
+p$design$modifier_effect_mode <- "full"
+p$design$adar_sd["ADAR"] <- 1
+f$site_info$modifier_active_ADAR <- f$site_info$editable
+f$site_info$modifier_slope_ADAR  <- adar_strength * as.numeric(f$site_info$editable)
+f$site_info$adar_sensitive       <- f$site_info$editable
+p$design$adar_condition_shift[c("WT_mock", "WT_IFNb"), "ADAR"] <- c(0, adar_shift)
+
+# sampling / depth
+f$site_info$editing_sampling_model <- "beta_binomial"
+f$site_info$precision <- phi
+f$transcript_info$baseline_expr <- 1000
+f$site_info$site_depth_multiplier <- target_depth / 1000
+f$site_info$coverage_fraction <- f$site_info$site_depth_multiplier
+
+p$design$lib_condition_scale[] <- 1
+p$design$lib_sdlog <- 0
+```
+
+```{r}
+sim <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_mock = n_reps, ADAR1KO_mock = n_reps), seed = 102)
+
+counts <- a2i_long_counts(sim)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts$ADAR_effect_z <- sim$sample_info$ADAR_effect_z[
+  match(counts$sample_id, sim$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts   <- subset(counts,   editable & depth > 0)
+counts$condition   <- factor(counts$condition,   levels = c("WT_mock", "ADAR1KO_mock"))
+
+
+fit1 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts)
+fit2 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts)
+summary(fit2)
+```
+
+
+```{r}
+summary(sim$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim$sample_info$ADAR_effect_z, sim$sample_info$condition, mean)
+```
+
+
+```{r}
+sim2 <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_IFNb = n_reps, ADAR1KO_IFNb = n_reps), seed = 102)
+
+counts_2 <- a2i_long_counts(sim2)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts_2$ADAR_effect_z <- sim2$sample_info$ADAR_effect_z[
+  match(counts_2$sample_id, sim2$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts_2 <- subset(counts_2, editable & depth > 0)
+counts_2$condition <- factor(counts_2$condition, levels = c("WT_IFNb", "ADAR1KO_IFNb"))
+
+
+fit1_2 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts_2)
+fit2_2 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts_2)
+summary(fit2_2)
+```
+
+```{r}
+summary(sim2$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim2$sample_info$ADAR_effect_z, sim2$sample_info$condition, mean)
+```
+
+
+```{r}
+sim3 <- a2i_simulate(p,
+  transcript_info = f$transcript_info, site_info = f$site_info,
+  n_per_condition = c(WT_mock = n_reps, WT_IFNb = n_reps), seed = 102)
+
+counts_3 <- a2i_long_counts(sim3)
+
+# add the per-sample ADAR effect (16 values) to every row of that sample
+counts_3$ADAR_effect_z <- sim3$sample_info$ADAR_effect_z[
+  match(counts_3$sample_id, sim3$sample_info$sample_id)
+]
+
+# keep rows that actually have reads
+counts_3 <- subset(counts_3, editable & depth > 0)
+counts_3$condition <- factor(counts_3$condition, levels = c("WT_mock", "WT_IFNb"))
+
+fit1_3 <- glm(cbind(alt_count, ref_count) ~ condition,
+            family = quasibinomial(), data = counts_3)
+fit2_3 <- glm(cbind(alt_count, ref_count) ~ condition + ADAR_effect_z,
+            family = quasibinomial(), data = counts_3)
+summary(fit2_3)
+```
+
+
+```{r}
+summary(sim3$site_info$modifier_slope_ADAR)                  # all 0? then the slope was lost
+tapply(sim3$sample_info$ADAR_effect_z, sim3$sample_info$condition, mean)
+```
+
+
+
+Plotting of the ADAR expression and editing levels of the four conditions 
+
+
+```{r}
+library(ggplot2)
+```
+
+```{r}
+#The four condtions 
+cond_order <- c("WT_mock", "WT_IFNb", "ADAR1KO_mock", "ADAR1KO_IFNb")
+
+#Simulation with all four conditions
+sim4 <- a2i_simulate(p,
+                     transcript_info = f$transcript_info, site_info = f$site_info,
+                     n_per_condition = setNames(rep(n_reps, 4), cond_order), seed = 102)
+
+#Make the counts
+counts4 <- a2i_long_counts(sim4)
+counts4$condition <- factor(counts4$condition, levels = cond_order)
+
+```
+
+
+Per sample summary
+
+```{r}
+#editing level per sample = total G reads / total reads over editable sites
+ed <- subset(counts4, editable & depth > 0)
+
+sample_edit <- aggregate(cbind(alt_count, depth) ~ sample_id, data = ed, FUN = sum)
+
+sample_edit$editing <- sample_edit$alt_count / sample_edit$depth
+
+samples <- sim4$sample_info[, c("sample_id", "condition", "ADAR", "ADAR_effect_z")]
+
+samples$condition <- factor(samples$condition, levels = cond_order)
+
+samples <- merge(samples, sample_edit[, c("sample_id", "editing")], by = "sample_id")
+
+cond_cols <- c(WT_mock = "#4C72B0", WT_IFNb = "#55A868",
+               ADAR1KO_mock = "#C44E52", ADAR1KO_IFNb = "#DD8452", p150KO_mock = "yellow", 
+               p150KO_IFNb = "purple")
+
+
+```
+
+
+Plotting 
+
+```{r}
+p_adar <- ggplot(samples, aes(condition, ADAR, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.12, size = 2) +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Simulated ADAR expression", title = "ADAR expression") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+``` 
+
+```{r}
+# ---- Plot 2: global editing level per sample --------------------------------
+p_edit <- ggplot(samples, aes(condition, editing * 100, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.12, size = 2) +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Editing level (% G reads, editable sites)",
+       title = "Global editing level per sample") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+ 
+```
+
+
+```{r}
+# ---- Plot 3: per-site editing distribution ----------------------------------
+site_level <- subset(ed, depth >= 10)
+p_sites <- ggplot(site_level, aes(condition, edit_prop, fill = condition)) +
+  geom_violin(scale = "width", alpha = 0.6) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white") +
+  scale_fill_manual(values = cond_cols) +
+  labs(x = NULL, y = "Editing proportion per site (depth >= 10)",
+       title = "Site-level editing") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+# ---- Plot 4: ADAR expression vs editing -------------------------------------
+p_scatter <- ggplot(samples, aes(ADAR, editing * 100, colour = condition)) +
+  geom_point(size = 3) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE, colour = "grey30") +
+  scale_colour_manual(values = cond_cols) +
+  labs(x = "Simulated ADAR expression", y = "Editing level (%)",
+       colour = NULL, title = "ADAR expression vs editing") +
+  theme_classic(base_size = 13)
+```
+
+```{r}
+p_adar
+p_edit
+p_sites
+p_scatter
+ 
+# Optional: all four in one figure (install.packages("patchwork") if needed)
+# library(patchwork)
+# (p_adar | p_edit) / (p_sites | p_scatter)
+
+
+#ggsave("p_adar_strength2.png", p_adar, width = 6, height = 4.5, dpi = 150)
+#ggsave("p_edit_strength2.png", p_edit, width = 6, height = 4.5, dpi = 150)
+#ggsave("p_sites_strength2.png", p_sites, width = 6, height = 4.5, dpi = 150)
+#ggsave("p_scatter_strength2.png", p_scatter, width = 6, height = 4.5, dpi = 150)
+```
+
+
+```{r}
+get_row <- function(name, fit1, fit2) {
+  c1 <- coef(summary(fit1)); c2 <- coef(summary(fit2))
+  cond <- grep("^condition", rownames(c1), value = TRUE)
+  data.frame(comparison       = name,
+             coefficient      = cond,
+             beta1_cond_only  = c1[cond, "Estimate"],
+             p_beta1_cond_only = c1[cond, "Pr(>|t|)"],
+             beta1_with_ADAR  = c2[cond, "Estimate"],
+             p_beta1_with_ADAR = c2[cond, "Pr(>|t|)"],
+             beta2_ADAR       = c2["ADAR_effect_z", "Estimate"],
+             se_beta2         = c2["ADAR_effect_z", "Std. Error"],
+             p_beta2          = c2["ADAR_effect_z", "Pr(>|t|)"],
+             dispersion       = summary(fit2)$dispersion)
+}
+
+res <- rbind(get_row("WT_mock vs ADAR1KO_mock", fit1,   fit2),
+             get_row("WT_IFNb vs ADAR1KO_IFNb", fit1_2, fit2_2),
+             get_row("WT_mock vs WT_IFNb",      fit1_3, fit2_3))
+print(res, digits = 3)
+```
+
+
